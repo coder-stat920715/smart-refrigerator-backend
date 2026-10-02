@@ -1,0 +1,14 @@
+spring:
+  jpa:
+    show-sql: false
+
+app:
+  mqtt:
+    enabled: false
+  firmware:
+    storage-dir: target/test-firmware-store
+    public-base-url: http://localhost:8080
+    signing-secret: test-secret
+  maintenance:
+    initial-delay-ms: 3600000
+    check-interval-ms: 3600000

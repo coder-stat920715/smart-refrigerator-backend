@@ -1,0 +1,6 @@
+target
+.git
+.idea
+*.iml
+firmware-store
+smart-refrigerator-backend.zip

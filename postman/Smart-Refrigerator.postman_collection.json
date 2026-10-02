@@ -1,0 +1,5369 @@
+{
+  "info": {
+    "_postman_id": "0c4d8ebb-a38c-4634-831d-e4f845877e2f",
+    "name": "Smart Refrigerator IoT Backend",
+    "description": "# Smart Refrigerator IoT Backend - end-to-end test collection\n\n## What you need\n1. Backend running: `docker compose up -d postgres emqx` then `mvn spring-boot:run` (or `docker compose up --build`).\n2. EMQX reachable on http://localhost:18083 (dashboard/API) with admin / public.\n3. (Optional) an MQTT subscriber to watch backend-to-device traffic: `mosquitto_sub -h localhost -p 1883 -t 'appliance/#' -v`.\n4. Two small files for firmware upload tests: `printf 'hello' > fw.bin`.\n\n## How MQTT is simulated\nPostman collections cannot publish MQTT, so every \"Publish ...\" request calls EMQX's HTTP API (`POST /api/v5/publish`) with the exact topic and JSON payload a refrigerator MCU would send.\nThe following GET request (1.5 s delay) checks what the backend stored.\n\n## Run order\nRun folders 0 -> 1 -> 2 -> 3 -> 4 -> 5 sequentially (Collection Runner or one by one). Folder 5B needs lowered thresholds, folder 6 needs file selection for the upload requests, folder 7 is manual, folder 8 cleans up.\nVariables (`deviceId`, `deviceIdB`, `firmwareId`, `jobId`, ...) are filled automatically by test scripts.\n\n## Timing rules to remember\n* A device is ONLINE only if it sent telemetry in the last 90 s - rerun a Publish telemetry step if you pause for long.\n* Spike filter: a jump larger than 15 C within 30 s of the previous reading is dropped (steps 2.6-2.9).\n* Alert rules use server receive time: defaults are 15 min (fridge/freezer), 5 min (door), 6 h (compressor).\n",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "0. Setup and health checks",
+      "description": "Run these first. Confirms the backend is up, the OpenAPI document is served, and obtains an EMQX API token used by every 'Publish ...' request (Postman cannot publish MQTT in a collection, so the EMQX HTTP API plays the role of the refrigerator MCU).",
+      "item": [
+        {
+          "name": "0.1 Backend health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/actuator/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "health"
+              ]
+            },
+            "description": "Calls Spring Boot Actuator. If this fails, start the stack (`docker compose up -d postgres emqx` then `mvn spring-boot:run`) and check the datasource settings.\n\n**Expected result:** 200 with {\"status\":\"UP\"}."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"status is UP\", () => pm.expect(j.status).to.eql(\"UP\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "0.2 OpenAPI document",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v3/api-docs",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v3",
+                "api-docs"
+              ]
+            },
+            "description": "Confirms springdoc is serving the generated spec. Swagger UI is at {{baseUrl}}/swagger-ui.html.\n\n**Expected result:** 200; paths include /api/v1/devices and /api/v1/firmware."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"documents the device endpoints\", () => pm.expect(Object.keys(j.paths)).to.include(\"/api/v1/devices\"));",
+                  "pm.test(\"documents the firmware endpoints\", () => pm.expect(Object.keys(j.paths)).to.include(\"/api/v1/firmware\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "0.3 EMQX login (get API token)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/login",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "login"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"{{emqxUser}}\",\n  \"password\": \"{{emqxPass}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Logs in to the EMQX dashboard API (default admin / public) and stores the bearer token in the collection variable `emqxToken`. If EMQX forced a password change, update `emqxPass` in the environment.\n\n**Expected result:** 200 with a token; saved to {{emqxToken}}."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"token returned\", () => pm.expect(j.token).to.be.a(\"string\").and.not.empty);",
+                  "pm.collectionVariables.set(\"emqxToken\", j.token);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "1. Device management (CRUD)",
+      "description": "Registers two devices and exercises validation, lookup, listing, update and status. Device A (hardware rev A2) is used by all later folders; device B stays offline and is used for negative tests. MAC addresses are randomised so the folder can be re-run.",
+      "item": [
+        {
+          "name": "1.1 Register device A",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"macAddress\": \"{{macALower}}\",\n  \"name\": \"Kitchen Fridge\",\n  \"model\": \"FX-200\",\n  \"hardwareRev\": \"A2\",\n  \"firmwareVersion\": \"1.0.0\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Sends the MAC in lower case on purpose to prove it is normalised. Saves the new id as {{deviceId}}.\n\n**Expected result:** 201; MAC upper-cased; status OFFLINE; state NORMAL_COOLING."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const hex = () => Math.floor(Math.random() * 256).toString(16).padStart(2, '0').toUpperCase();",
+                  "const mac = ['AA', 'BB', hex(), hex(), hex(), hex()].join(':');",
+                  "pm.collectionVariables.set('macA', mac);",
+                  "pm.collectionVariables.set('macALower', mac.toLowerCase());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 201\", () => pm.response.to.have.status(201));",
+                  "const j = pm.response.json();",
+                  "pm.collectionVariables.set(\"deviceId\", j.id);",
+                  "pm.test(\"id is a UUID\", () => pm.expect(j.id).to.match(/^[0-9a-f-]{36}$/));",
+                  "pm.test(\"MAC normalised to upper case\", () => pm.expect(j.macAddress).to.eql(pm.collectionVariables.get(\"macA\")));",
+                  "pm.test(\"starts OFFLINE\", () => pm.expect(j.status).to.eql(\"OFFLINE\"));",
+                  "pm.test(\"starts NORMAL_COOLING\", () => pm.expect(j.operationalState).to.eql(\"NORMAL_COOLING\"));",
+                  "pm.test(\"firmware 1.0.0, hardware A2\", () => { pm.expect(j.firmwareVersion).to.eql(\"1.0.0\"); pm.expect(j.hardwareRev).to.eql(\"A2\"); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1.2 Register duplicate MAC",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"macAddress\": \"{{macA}}\",\n  \"name\": \"Duplicate\",\n  \"hardwareRev\": \"A2\",\n  \"firmwareVersion\": \"1.0.0\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Registers the same MAC again.\n\n**Expected result:** 409 Conflict with an 'already registered' message."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 409\", () => pm.response.to.have.status(409));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"message mentions duplicate\", () => pm.expect(j.message).to.include(\"already registered\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1.3 Register with invalid MAC",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"macAddress\": \"not-a-mac\",\n  \"name\": \"Bad\",\n  \"hardwareRev\": \"A1\",\n  \"firmwareVersion\": \"1.0.0\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Bean-validation check of the MAC pattern.\n\n**Expected result:** 400 with details naming macAddress."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 400\", () => pm.response.to.have.status(400));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"field error for macAddress\", () => pm.expect(j.details.join(\" \")).to.include(\"macAddress\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1.4 Register with missing fields",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Empty body: macAddress, name, hardwareRev and firmwareVersion are mandatory.\n\n**Expected result:** 400 with at least 4 field errors."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 400\", () => pm.response.to.have.status(400));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"one detail per missing field (>= 4)\", () => pm.expect(j.details.length).to.be.at.least(4));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1.5 Get device by id",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}"
+              ]
+            },
+            "description": "Fetch device A by UUID.\n\n**Expected result:** 200 with the device."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"same id\", () => pm.expect(j.id).to.eql(pm.collectionVariables.get(\"deviceId\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1.6 Get device by MAC",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/by-mac/{{macALower}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "by-mac",
+                "{{macALower}}"
+              ]
+            },
+            "description": "Looks the device up by MAC (lower-case input is normalised).\n\n**Expected result:** 200 with device A."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"same device (case-insensitive lookup)\", () => pm.expect(j.id).to.eql(pm.collectionVariables.get(\"deviceId\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1.7 List devices (paged)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices?page=0&size=50",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "0"
+                },
+                {
+                  "key": "size",
+                  "value": "50"
+                }
+              ]
+            },
+            "description": "Paginated listing, newest first.\n\n**Expected result:** 200; content includes device A."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"page metadata present\", () => { pm.expect(j).to.have.property(\"totalElements\"); pm.expect(j.page).to.eql(0); });",
+                  "pm.test(\"device A is listed\", () => pm.expect(j.content.map(d => d.id)).to.include(pm.collectionVariables.get(\"deviceId\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1.8 List devices filtered by status",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices?status=OFFLINE",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices"
+              ],
+              "query": [
+                {
+                  "key": "status",
+                  "value": "OFFLINE"
+                }
+              ]
+            },
+            "description": "Status filter. Device A has not sent telemetry yet so it must appear here.\n\n**Expected result:** 200; every item OFFLINE."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"all returned devices are OFFLINE\", () => j.content.forEach(d => pm.expect(d.status).to.eql(\"OFFLINE\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1.9 Update device metadata",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Kitchen Fridge (Updated)\",\n  \"model\": \"FX-200 Pro\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Partial update: only supplied non-blank fields change.\n\n**Expected result:** 200 with new name/model; hardwareRev still A2."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"name and model updated\", () => { pm.expect(j.name).to.eql(\"Kitchen Fridge (Updated)\"); pm.expect(j.model).to.eql(\"FX-200 Pro\"); });",
+                  "pm.test(\"hardware revision untouched\", () => pm.expect(j.hardwareRev).to.eql(\"A2\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1.10 Device status before any telemetry",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "status"
+              ]
+            },
+            "description": "Lightweight status endpoint.\n\n**Expected result:** online=false, status OFFLINE, 0 active faults."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"offline, no faults\", () => { pm.expect(j.online).to.eql(false); pm.expect(j.status).to.eql(\"OFFLINE\"); pm.expect(j.activeFaultCount).to.eql(0); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1.11 Get unknown device",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/00000000-0000-0000-0000-000000000000",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "00000000-0000-0000-0000-000000000000"
+              ]
+            },
+            "description": "Unknown UUID.\n\n**Expected result:** 404 with a structured error body."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 404\", () => pm.response.to.have.status(404));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"message says not found\", () => pm.expect(j.message).to.include(\"not found\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1.12 Register device B (stays offline)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"macAddress\": \"{{macB}}\",\n  \"name\": \"Garage Freezer\",\n  \"model\": \"FX-100\",\n  \"hardwareRev\": \"A1\",\n  \"firmwareVersion\": \"1.0.0\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "A second device that never sends telemetry; used for 'offline' negative tests.\n\n**Expected result:** 201; id saved as {{deviceIdB}}."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const hex = () => Math.floor(Math.random() * 256).toString(16).padStart(2, '0').toUpperCase();",
+                  "pm.collectionVariables.set('macB', ['CC', 'DD', hex(), hex(), hex(), hex()].join(':'));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 201\", () => pm.response.to.have.status(201));",
+                  "const j = pm.response.json();",
+                  "pm.collectionVariables.set(\"deviceIdB\", j.id);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2. Telemetry ingestion over MQTT",
+      "description": "The 'Publish' requests call EMQX's HTTP publish API, which delivers exactly what an MCU would publish to `appliance/{deviceId}/telemetry`. Each publish is followed by a GET (with a 1.5 s pre-request delay) that verifies what the backend persisted. Run steps 2.6 -> 2.9 within 30 seconds of each other (spike filter window). Optional: watch traffic with `mosquitto_sub -h localhost -p 1883 -t 'appliance/#' -v`.",
+      "item": [
+        {
+          "name": "2.1 Publish valid telemetry (fridge 4.0)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/publish",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "publish"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"topic\": \"appliance/{{deviceId}}/telemetry\",\n  \"qos\": 1,\n  \"retain\": false,\n  \"payload\": \"{\\\"freezerTemp\\\":-18.5,\\\"fridgeTemp\\\":4.0,\\\"compressorOn\\\":true,\\\"doorOpen\\\":false}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{emqxToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "Publishes {\"freezerTemp\":-18.5,\"fridgeTemp\":4.0,\"compressorOn\":true,\"doorOpen\":false}.\n\n**Expected result:** EMQX returns 200/202; the backend receives the message on the device topic."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"EMQX accepted the publish (HTTP 200/202)\", () => pm.expect([200, 202]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2.2 Verify telemetry was stored",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/telemetry/latest",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "telemetry",
+                "latest"
+              ]
+            },
+            "description": "Reads the newest reading. If this is 404, the MQTT message did not reach the backend: check the broker URL and the backend logs.\n\n**Expected result:** 200; reading equals the published values and is recent."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// give the backend a moment to consume the MQTT message",
+                  "setTimeout(function () {}, 1500);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"values match the published payload\", () => { pm.expect(j.fridgeTemp).to.eql(4); pm.expect(j.freezerTemp).to.eql(-18.5); pm.expect(j.compressorOn).to.eql(true); pm.expect(j.doorOpen).to.eql(false); });",
+                  "pm.test(\"timestamp is recent (< 60 s)\", () => pm.expect(Date.now() - new Date(j.time).getTime()).to.be.below(60000));",
+                  "pm.collectionVariables.set(\"lastTelemetryId\", j.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2.3 Device is now ONLINE (heartbeat)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "status"
+              ]
+            },
+            "description": "Every telemetry message doubles as a heartbeat and flips OFFLINE -> ONLINE.\n\n**Expected result:** status ONLINE with lastSeenAt."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"online\", () => { pm.expect(j.online).to.eql(true); pm.expect(j.status).to.eql(\"ONLINE\"); });",
+                  "pm.test(\"lastSeenAt set\", () => pm.expect(j.lastSeenAt).to.be.a(\"string\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2.4 Publish out-of-range telemetry (fridge 999)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/publish",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "publish"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"topic\": \"appliance/{{deviceId}}/telemetry\",\n  \"qos\": 1,\n  \"retain\": false,\n  \"payload\": \"{\\\"freezerTemp\\\":-18.0,\\\"fridgeTemp\\\":999.0,\\\"compressorOn\\\":true,\\\"doorOpen\\\":false}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{emqxToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "Value outside [-60, 60] C: must be filtered as noise.\n\n**Expected result:** EMQX returns 200/202; the backend receives the message on the device topic."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"EMQX accepted the publish (HTTP 200/202)\", () => pm.expect([200, 202]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2.5 Verify out-of-range reading was dropped",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/telemetry/latest",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "telemetry",
+                "latest"
+              ]
+            },
+            "description": "The newest stored reading must still be the one from step 2.2.\n\n**Expected result:** Same reading id as step 2.2."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// give the backend a moment to consume the MQTT message",
+                  "setTimeout(function () {}, 1500);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"latest reading unchanged\", () => pm.expect(j.id).to.eql(pm.collectionVariables.get(\"lastTelemetryId\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2.6 Publish fresh valid telemetry (fridge 4.2)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/publish",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "publish"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"topic\": \"appliance/{{deviceId}}/telemetry\",\n  \"qos\": 1,\n  \"retain\": false,\n  \"payload\": \"{\\\"freezerTemp\\\":-18.0,\\\"fridgeTemp\\\":4.2,\\\"compressorOn\\\":true,\\\"doorOpen\\\":false}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{emqxToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "Establishes a new baseline reading for the spike test.\n\n**Expected result:** EMQX returns 200/202; the backend receives the message on the device topic."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"EMQX accepted the publish (HTTP 200/202)\", () => pm.expect([200, 202]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2.7 Verify the 4.2 reading was stored",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/telemetry/latest",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "telemetry",
+                "latest"
+              ]
+            },
+            "description": "Saves its id for the spike check.\n\n**Expected result:** fridgeTemp 4.2."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// give the backend a moment to consume the MQTT message",
+                  "setTimeout(function () {}, 1500);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"fridge 4.2\", () => pm.expect(j.fridgeTemp).to.eql(4.2));",
+                  "pm.collectionVariables.set(\"lastTelemetryId\", j.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2.8 Publish spike telemetry (fridge 40.0)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/publish",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "publish"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"topic\": \"appliance/{{deviceId}}/telemetry\",\n  \"qos\": 1,\n  \"retain\": false,\n  \"payload\": \"{\\\"freezerTemp\\\":-18.0,\\\"fridgeTemp\\\":40.0,\\\"compressorOn\\\":true,\\\"doorOpen\\\":false}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{emqxToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "A 35.8 C jump within 30 s (limit 15 C) must be rejected. Run this within 30 s of step 2.6.\n\n**Expected result:** EMQX returns 200/202; the backend receives the message on the device topic."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"EMQX accepted the publish (HTTP 200/202)\", () => pm.expect([200, 202]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2.9 Verify spike was dropped",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/telemetry/latest",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "telemetry",
+                "latest"
+              ]
+            },
+            "description": "If you ran step 2.8 more than 30 s after 2.6, the window has passed and the reading would be accepted; just rerun 2.6-2.9.\n\n**Expected result:** Still the 4.2 reading."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// give the backend a moment to consume the MQTT message",
+                  "setTimeout(function () {}, 1500);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"latest reading unchanged\", () => { pm.expect(j.id).to.eql(pm.collectionVariables.get(\"lastTelemetryId\")); pm.expect(j.fridgeTemp).to.eql(4.2); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2.10 Publish reading with compressor OFF (fridge 4.5)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/publish",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "publish"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"topic\": \"appliance/{{deviceId}}/telemetry\",\n  \"qos\": 1,\n  \"retain\": false,\n  \"payload\": \"{\\\"freezerTemp\\\":-17.5,\\\"fridgeTemp\\\":4.5,\\\"compressorOn\\\":false,\\\"doorOpen\\\":false}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{emqxToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "Third reading; gives the stats endpoint a compressor-off sample.\n\n**Expected result:** EMQX returns 200/202; the backend receives the message on the device topic."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"EMQX accepted the publish (HTTP 200/202)\", () => pm.expect([200, 202]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2.11 Publish malformed JSON",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/publish",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "publish"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"topic\": \"appliance/{{deviceId}}/telemetry\",\n  \"qos\": 1,\n  \"retain\": false,\n  \"payload\": \"this is not json\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{emqxToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "The backend must log and ignore it without crashing the MQTT subscriber.\n\n**Expected result:** EMQX 200/202; backend logs an error but keeps running."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"EMQX accepted the publish (HTTP 200/202)\", () => pm.expect([200, 202]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2.12 Verify latest is the 4.5 reading",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/telemetry/latest",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "telemetry",
+                "latest"
+              ]
+            },
+            "description": "Proves 2.10 was stored and 2.11 was ignored.\n\n**Expected result:** fridgeTemp 4.5, compressorOn false."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// give the backend a moment to consume the MQTT message",
+                  "setTimeout(function () {}, 1500);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"fridge 4.5, compressor off\", () => { pm.expect(j.fridgeTemp).to.eql(4.5); pm.expect(j.compressorOn).to.eql(false); });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3. Telemetry queries (REST)",
+      "description": "Read-side APIs over the 3 readings stored in folder 2 (4.0 / 4.2 / 4.5 C).",
+      "item": [
+        {
+          "name": "3.1 Latest reading",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/telemetry/latest",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "telemetry",
+                "latest"
+              ]
+            },
+            "description": "Newest reading.\n\n**Expected result:** 200; fridgeTemp 4.5."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"fridge 4.5\", () => pm.expect(j.fridgeTemp).to.eql(4.5));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.2 History (default last 24 h)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/telemetry",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "telemetry"
+              ]
+            },
+            "description": "Rejected readings (999, 40.0, malformed) are not counted.\n\n**Expected result:** totalElements = 3, newest first."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"3 accepted readings\", () => pm.expect(j.totalElements).to.eql(3));",
+                  "pm.test(\"sorted newest first\", () => { const t = j.content.map(r => new Date(r.time).getTime()); pm.expect(t).to.eql([...t].sort((a, b) => b - a)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.3 History with explicit from/to",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/telemetry?from={{fromIso}}&to={{toIso}}&size=10",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "telemetry"
+              ],
+              "query": [
+                {
+                  "key": "from",
+                  "value": "{{fromIso}}"
+                },
+                {
+                  "key": "to",
+                  "value": "{{toIso}}"
+                },
+                {
+                  "key": "size",
+                  "value": "10"
+                }
+              ]
+            },
+            "description": "ISO-8601 range: last hour up to one minute from now.\n\n**Expected result:** 3 readings."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('fromIso', new Date(Date.now() - 3600 * 1000).toISOString());",
+                  "pm.collectionVariables.set('toIso', new Date(Date.now() + 60 * 1000).toISOString());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"3 readings in range\", () => pm.expect(j.content.length).to.eql(3));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.4 History paging (size=2)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/telemetry?page=0&size=2",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "telemetry"
+              ],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "0"
+                },
+                {
+                  "key": "size",
+                  "value": "2"
+                }
+              ]
+            },
+            "description": "Pagination metadata.\n\n**Expected result:** 2 items, totalPages 2, last=false."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"2 items, 2 pages, not last\", () => { pm.expect(j.content.length).to.eql(2); pm.expect(j.totalPages).to.eql(2); pm.expect(j.last).to.eql(false); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.5 Aggregated statistics",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/telemetry/stats",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "telemetry",
+                "stats"
+              ]
+            },
+            "description": "avg/min/max temperatures and compressor duty cycle over the last 24 h.\n\n**Expected result:** Values computed from the 3 readings."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"3 samples\", () => pm.expect(j.samples).to.eql(3));",
+                  "pm.test(\"fridge min/max/avg\", () => { pm.expect(j.minFridgeTemp).to.eql(4); pm.expect(j.maxFridgeTemp).to.eql(4.5); pm.expect(j.avgFridgeTemp).to.be.closeTo(4.2333, 0.01); });",
+                  "pm.test(\"freezer min/max/avg\", () => { pm.expect(j.minFreezerTemp).to.eql(-18.5); pm.expect(j.maxFreezerTemp).to.eql(-17.5); pm.expect(j.avgFreezerTemp).to.be.closeTo(-18.0, 0.01); });",
+                  "pm.test(\"compressor duty cycle 2/3\", () => pm.expect(j.compressorDutyCycle).to.be.closeTo(0.6667, 0.01));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.6 Invalid range (from after to)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/telemetry?from={{toIso}}&to={{fromIso}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "telemetry"
+              ],
+              "query": [
+                {
+                  "key": "from",
+                  "value": "{{toIso}}"
+                },
+                {
+                  "key": "to",
+                  "value": "{{fromIso}}"
+                }
+              ]
+            },
+            "description": "Swaps from/to from step 3.3.\n\n**Expected result:** 400."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 400\", () => pm.response.to.have.status(400));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"explains the range problem\", () => pm.expect(j.message).to.include(\"earlier\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.7 Malformed date parameter",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/telemetry?from=yesterday",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "telemetry"
+              ],
+              "query": [
+                {
+                  "key": "from",
+                  "value": "yesterday"
+                }
+              ]
+            },
+            "description": "Not an ISO instant.\n\n**Expected result:** 400 Malformed request."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 400\", () => pm.response.to.have.status(400));",
+                  "const j = pm.response.json();"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.8 Telemetry of unknown device",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/00000000-0000-0000-0000-000000000000/telemetry",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "00000000-0000-0000-0000-000000000000",
+                "telemetry"
+              ]
+            },
+            "description": "Unknown device id.\n\n**Expected result:** 404."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 404\", () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.9 Latest for device with no data (device B)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceIdB}}/telemetry/latest",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceIdB}}",
+                "telemetry",
+                "latest"
+              ]
+            },
+            "description": "Device B never sent anything.\n\n**Expected result:** 404 'No telemetry recorded yet'."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 404\", () => pm.response.to.have.status(404));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"says no telemetry\", () => pm.expect(j.message).to.include(\"No telemetry\"));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4. Remote commands",
+      "description": "Commands are published by the backend to `appliance/{deviceId}/commands` with QoS 1. To see the actual MQTT messages run `mosquitto_sub -h localhost -p 1883 -t 'appliance/+/commands' -v` (or use the EMQX dashboard WebSocket client) while running this folder. Device A must be ONLINE (folder 2 ran less than 90 s ago; if not, rerun step 2.6).",
+      "item": [
+        {
+          "name": "4.1 FORCE_DEFROST",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/commands",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "commands"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"FORCE_DEFROST\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Dispatches a defrost command and optimistically moves the state machine to DEFROST_CYCLE.\n\n**Expected result:** 202; topic appliance/{id}/commands; protocol MQTT-QOS1."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 202\", () => pm.response.to.have.status(202));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"response describes the dispatch\", () => { pm.expect(j.type).to.eql(\"FORCE_DEFROST\"); pm.expect(j.topic).to.eql(\"appliance/\" + pm.collectionVariables.get(\"deviceId\") + \"/commands\"); pm.expect(j.protocol).to.eql(\"MQTT-QOS1\"); pm.expect(j.commandId).to.be.a(\"string\"); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4.2 State is DEFROST_CYCLE",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}"
+              ]
+            },
+            "description": "State pattern: DEFROST_STARTED event applied.\n\n**Expected result:** operationalState DEFROST_CYCLE."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"DEFROST_CYCLE\", () => pm.expect(j.operationalState).to.eql(\"DEFROST_CYCLE\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4.3 Device reports state NORMAL_COOLING",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/publish",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "publish"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"topic\": \"appliance/{{deviceId}}/state\",\n  \"qos\": 1,\n  \"retain\": false,\n  \"payload\": \"{\\\"state\\\":\\\"NORMAL_COOLING\\\"}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{emqxToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "The MCU is the source of truth and reports the end of the defrost on `appliance/{id}/state`.\n\n**Expected result:** EMQX returns 200/202; the backend receives the message on the device topic."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"EMQX accepted the publish (HTTP 200/202)\", () => pm.expect([200, 202]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4.4 State returns to NORMAL_COOLING",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}"
+              ]
+            },
+            "description": "Backend adopted the device-reported state.\n\n**Expected result:** operationalState NORMAL_COOLING."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// give the backend a moment to consume the MQTT message",
+                  "setTimeout(function () {}, 1500);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"NORMAL_COOLING\", () => pm.expect(j.operationalState).to.eql(\"NORMAL_COOLING\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4.5 SET_TEMPERATURE_TARGET (valid)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/commands",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "commands"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"SET_TEMPERATURE_TARGET\",\n  \"fridgeTargetTemp\": 3.5,\n  \"freezerTargetTemp\": -20.0\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Fridge target 0..10 C, freezer target -30..-10 C.\n\n**Expected result:** 202."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 202\", () => pm.response.to.have.status(202));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"type echoed\", () => pm.expect(j.type).to.eql(\"SET_TEMPERATURE_TARGET\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4.6 SET_TEMPERATURE_TARGET without any target",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/commands",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "commands"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"SET_TEMPERATURE_TARGET\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Business-rule validation in the service layer.\n\n**Expected result:** 400."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 400\", () => pm.response.to.have.status(400));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"explains what is required\", () => pm.expect(j.message).to.include(\"requires\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4.7 SET_TEMPERATURE_TARGET out of range",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/commands",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "commands"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"SET_TEMPERATURE_TARGET\",\n  \"fridgeTargetTemp\": 25.0\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Bean validation: fridge target max is 10 C.\n\n**Expected result:** 400 with a fridgeTargetTemp error."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 400\", () => pm.response.to.have.status(400));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"field error for fridgeTargetTemp\", () => pm.expect(j.details.join(\" \")).to.include(\"fridgeTargetTemp\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4.8 Unknown command type",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/commands",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "commands"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"type\": \"SELF_DESTRUCT\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Enum value not supported.\n\n**Expected result:** 400."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 400\", () => pm.response.to.have.status(400));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"malformed request\", () => pm.expect(j.message).to.include(\"Malformed\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4.9 Missing command type",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/commands",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "commands"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "type is mandatory.\n\n**Expected result:** 400."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 400\", () => pm.response.to.have.status(400));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"field error for type\", () => pm.expect(j.details.join(\" \")).to.include(\"type\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4.10 REBOOT",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/commands",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "commands"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"REBOOT\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Reboot command.\n\n**Expected result:** 202."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 202\", () => pm.response.to.have.status(202));",
+                  "const j = pm.response.json();"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4.11 REQUEST_DIAGNOSTICS",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/commands",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "commands"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"REQUEST_DIAGNOSTICS\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Diagnostics request.\n\n**Expected result:** 202."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 202\", () => pm.response.to.have.status(202));",
+                  "const j = pm.response.json();"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4.12 Command to OFFLINE device B",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceIdB}}/commands",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceIdB}}",
+                "commands"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"FORCE_DEFROST\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Device B never sent a heartbeat.\n\n**Expected result:** 409 Conflict."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 409\", () => pm.response.to.have.status(409));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"says offline\", () => pm.expect(j.message).to.include(\"offline\"));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "5. Faults and device-reported alerts",
+      "description": "Alerts published by the MCU on `appliance/{id}/alerts` become fault events. A CRITICAL fault sets the device status to FAULT and the state to CRITICAL_FAULT; a WARNING does not change the status. Device A must be ONLINE.",
+      "item": [
+        {
+          "name": "5.1 Device publishes CRITICAL alert (E21)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/publish",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "publish"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"topic\": \"appliance/{{deviceId}}/alerts\",\n  \"qos\": 1,\n  \"retain\": false,\n  \"payload\": \"{\\\"code\\\":\\\"E21\\\",\\\"message\\\":\\\"Evaporator fan stalled\\\",\\\"severity\\\":\\\"CRITICAL\\\"}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{emqxToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "Simulates a hardware fault report.\n\n**Expected result:** EMQX returns 200/202; the backend receives the message on the device topic."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"EMQX accepted the publish (HTTP 200/202)\", () => pm.expect([200, 202]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5.2 Active fault was recorded",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/faults?deviceId={{deviceId}}&active=true",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "faults"
+              ],
+              "query": [
+                {
+                  "key": "deviceId",
+                  "value": "{{deviceId}}"
+                },
+                {
+                  "key": "active",
+                  "value": "true"
+                }
+              ]
+            },
+            "description": "Lists active faults of device A and saves the id as {{faultId}}.\n\n**Expected result:** One active DEVICE_REPORTED CRITICAL fault."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// give the backend a moment to consume the MQTT message",
+                  "setTimeout(function () {}, 1500);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"exactly one active fault\", () => pm.expect(j.content.length).to.eql(1));",
+                  "pm.test(\"DEVICE_REPORTED / CRITICAL / mentions E21\", () => { const f = j.content[0]; pm.expect(f.type).to.eql(\"DEVICE_REPORTED\"); pm.expect(f.severity).to.eql(\"CRITICAL\"); pm.expect(f.message).to.include(\"E21\"); pm.expect(f.active).to.eql(true); });",
+                  "pm.collectionVariables.set(\"faultId\", j.content[0].id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5.3 Status is FAULT",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "status"
+              ]
+            },
+            "description": "Fault engine updated the device status and state machine.\n\n**Expected result:** status FAULT, state CRITICAL_FAULT, count 1."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"FAULT with 1 active fault\", () => { pm.expect(j.status).to.eql(\"FAULT\"); pm.expect(j.activeFaultCount).to.eql(1); pm.expect(j.operationalState).to.eql(\"CRITICAL_FAULT\"); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5.4 Get fault by id",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/faults/{{faultId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "faults",
+                "{{faultId}}"
+              ]
+            },
+            "description": "Single fault lookup.\n\n**Expected result:** 200; active=true."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"active\", () => pm.expect(j.active).to.eql(true));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5.5 Resolve the fault",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/faults/{{faultId}}/resolve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "faults",
+                "{{faultId}}",
+                "resolve"
+              ]
+            },
+            "description": "Manual resolution (an operator acknowledges the fault).\n\n**Expected result:** 200; active=false; resolvedAt set."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"resolved\", () => { pm.expect(j.active).to.eql(false); pm.expect(j.resolvedAt).to.be.a(\"string\"); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5.6 Status returns to ONLINE",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "status"
+              ]
+            },
+            "description": "Last critical fault cleared -> FAULTS_CLEARED transition.\n\n**Expected result:** status ONLINE; state NORMAL_COOLING."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"ONLINE, no faults, NORMAL_COOLING\", () => { pm.expect(j.status).to.eql(\"ONLINE\"); pm.expect(j.activeFaultCount).to.eql(0); pm.expect(j.operationalState).to.eql(\"NORMAL_COOLING\"); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5.7 Resolve again (idempotent)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/faults/{{faultId}}/resolve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "faults",
+                "{{faultId}}",
+                "resolve"
+              ]
+            },
+            "description": "Resolving a resolved fault is a no-op.\n\n**Expected result:** 200; unchanged."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"still resolved\", () => pm.expect(j.active).to.eql(false));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5.8 Unknown fault",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/faults/00000000-0000-0000-0000-000000000000",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "faults",
+                "00000000-0000-0000-0000-000000000000"
+              ]
+            },
+            "description": "Unknown id.\n\n**Expected result:** 404."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 404\", () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5.9 List all faults of the device",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/faults?deviceId={{deviceId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "faults"
+              ],
+              "query": [
+                {
+                  "key": "deviceId",
+                  "value": "{{deviceId}}"
+                }
+              ]
+            },
+            "description": "History includes resolved faults.\n\n**Expected result:** 1 item, active=false."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"1 historical fault, resolved\", () => { pm.expect(j.totalElements).to.eql(1); pm.expect(j.content[0].active).to.eql(false); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5.10 Device publishes WARNING alert",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/publish",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "publish"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"topic\": \"appliance/{{deviceId}}/alerts\",\n  \"qos\": 1,\n  \"retain\": false,\n  \"payload\": \"{\\\"code\\\":\\\"W07\\\",\\\"message\\\":\\\"Water filter due\\\",\\\"severity\\\":\\\"WARNING\\\"}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{emqxToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "Warnings must not mark the device as FAULT.\n\n**Expected result:** EMQX returns 200/202; the backend receives the message on the device topic."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"EMQX accepted the publish (HTTP 200/202)\", () => pm.expect([200, 202]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5.11 Warning is recorded, status stays ONLINE",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/faults?deviceId={{deviceId}}&active=true",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "faults"
+              ],
+              "query": [
+                {
+                  "key": "deviceId",
+                  "value": "{{deviceId}}"
+                },
+                {
+                  "key": "active",
+                  "value": "true"
+                }
+              ]
+            },
+            "description": "Saves the id as {{warnFaultId}}.\n\n**Expected result:** One active WARNING fault."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// give the backend a moment to consume the MQTT message",
+                  "setTimeout(function () {}, 1500);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"one active WARNING\", () => { pm.expect(j.content.length).to.eql(1); pm.expect(j.content[0].severity).to.eql(\"WARNING\"); });",
+                  "pm.collectionVariables.set(\"warnFaultId\", j.content[0].id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5.12 Status unchanged by warning",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "status"
+              ]
+            },
+            "description": "Warnings count as active faults but do not change the status.\n\n**Expected result:** ONLINE, activeFaultCount 1."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"still ONLINE with 1 active fault\", () => { pm.expect(j.status).to.eql(\"ONLINE\"); pm.expect(j.activeFaultCount).to.eql(1); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5.13 Resolve the warning",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/faults/{{warnFaultId}}/resolve",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "faults",
+                "{{warnFaultId}}",
+                "resolve"
+              ]
+            },
+            "description": "Cleanup.\n\n**Expected result:** 200."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"resolved\", () => pm.expect(j.active).to.eql(false));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "5B. Sustained-condition alert rules (needs lowered thresholds, ~2 min of waiting)",
+      "description": "The built-in rules need a condition to hold for minutes (fridge > 10 C for 15 min, door open 5 min). To test them quickly start the backend with `APP_ALERTS_FRIDGE_BREACH_MINUTES=1 APP_ALERTS_DOOR_OPEN_MINUTES=1` (docker-compose: add them under backend.environment). Steps marked WAIT use a ~65 s pre-request delay. The rules use server receive time, so real waiting is required. Skip this folder with default thresholds.",
+      "item": [
+        {
+          "name": "5B.1 Door open - first reading",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/publish",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "publish"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"topic\": \"appliance/{{deviceId}}/telemetry\",\n  \"qos\": 1,\n  \"retain\": false,\n  \"payload\": \"{\\\"freezerTemp\\\":-18.0,\\\"fridgeTemp\\\":4.5,\\\"compressorOn\\\":true,\\\"doorOpen\\\":true}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{emqxToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "Starts the 'door open' run.\n\n**Expected result:** EMQX returns 200/202; the backend receives the message on the device topic."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"EMQX accepted the publish (HTTP 200/202)\", () => pm.expect([200, 202]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5B.2 WAIT 65 s, then door open - second reading",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/publish",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "publish"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"topic\": \"appliance/{{deviceId}}/telemetry\",\n  \"qos\": 1,\n  \"retain\": false,\n  \"payload\": \"{\\\"freezerTemp\\\":-18.0,\\\"fridgeTemp\\\":4.5,\\\"compressorOn\\\":true,\\\"doorOpen\\\":true}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{emqxToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "Second 'door open' reading 65 s later -> DOOR_LEFT_OPEN fault. If your Postman limits script time, wait manually then send.\n\n**Expected result:** EMQX 200/202."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// wait 65 seconds so the door has been open longer than the (lowered) 1 minute threshold",
+                  "setTimeout(function () {}, 65000);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"EMQX accepted the publish (HTTP 200/202)\", () => pm.expect([200, 202]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5B.3 DOOR_LEFT_OPEN fault raised",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/faults?deviceId={{deviceId}}&active=true",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "faults"
+              ],
+              "query": [
+                {
+                  "key": "deviceId",
+                  "value": "{{deviceId}}"
+                },
+                {
+                  "key": "active",
+                  "value": "true"
+                }
+              ]
+            },
+            "description": "Alert engine evaluated the readings after commit.\n\n**Expected result:** One active DOOR_LEFT_OPEN WARNING."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// give the backend a moment to consume the MQTT message",
+                  "setTimeout(function () {}, 1500);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"DOOR_LEFT_OPEN / WARNING\", () => { pm.expect(j.content.length).to.eql(1); pm.expect(j.content[0].type).to.eql(\"DOOR_LEFT_OPEN\"); pm.expect(j.content[0].severity).to.eql(\"WARNING\"); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5B.4 State is DOOR_ALARM, status ONLINE",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}"
+              ]
+            },
+            "description": "State pattern: DOOR_ALARM_RAISED.\n\n**Expected result:** operationalState DOOR_ALARM."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"DOOR_ALARM and ONLINE\", () => { pm.expect(j.operationalState).to.eql(\"DOOR_ALARM\"); pm.expect(j.status).to.eql(\"ONLINE\"); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5B.5 Door closed",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/publish",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "publish"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"topic\": \"appliance/{{deviceId}}/telemetry\",\n  \"qos\": 1,\n  \"retain\": false,\n  \"payload\": \"{\\\"freezerTemp\\\":-18.0,\\\"fridgeTemp\\\":4.5,\\\"compressorOn\\\":true,\\\"doorOpen\\\":false}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{emqxToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "Door closes -> condition cleared.\n\n**Expected result:** EMQX returns 200/202; the backend receives the message on the device topic."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"EMQX accepted the publish (HTTP 200/202)\", () => pm.expect([200, 202]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5B.6 Door fault auto-resolved",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/faults?deviceId={{deviceId}}&active=true",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "faults"
+              ],
+              "query": [
+                {
+                  "key": "deviceId",
+                  "value": "{{deviceId}}"
+                },
+                {
+                  "key": "active",
+                  "value": "true"
+                }
+              ]
+            },
+            "description": "Engine auto-resolves when the condition clears.\n\n**Expected result:** No active faults."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// give the backend a moment to consume the MQTT message",
+                  "setTimeout(function () {}, 1500);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"no active faults\", () => pm.expect(j.content.length).to.eql(0));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5B.7 State back to NORMAL_COOLING",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}"
+              ]
+            },
+            "description": "DOOR_ALARM_CLEARED.\n\n**Expected result:** NORMAL_COOLING."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"NORMAL_COOLING\", () => pm.expect(j.operationalState).to.eql(\"NORMAL_COOLING\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5B.8 Fridge too warm - first reading (12.0 C)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/publish",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "publish"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"topic\": \"appliance/{{deviceId}}/telemetry\",\n  \"qos\": 1,\n  \"retain\": false,\n  \"payload\": \"{\\\"freezerTemp\\\":-18.0,\\\"fridgeTemp\\\":12.0,\\\"compressorOn\\\":true,\\\"doorOpen\\\":false}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{emqxToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "Starts the over-temperature run (threshold 10 C).\n\n**Expected result:** EMQX returns 200/202; the backend receives the message on the device topic."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"EMQX accepted the publish (HTTP 200/202)\", () => pm.expect([200, 202]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5B.9 WAIT 65 s, then fridge too warm - second reading",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/publish",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "publish"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"topic\": \"appliance/{{deviceId}}/telemetry\",\n  \"qos\": 1,\n  \"retain\": false,\n  \"payload\": \"{\\\"freezerTemp\\\":-18.0,\\\"fridgeTemp\\\":12.5,\\\"compressorOn\\\":true,\\\"doorOpen\\\":false}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{emqxToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "Second reading above 10 C, 65 s after the first.\n\n**Expected result:** EMQX 200/202."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "setTimeout(function () {}, 65000);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"EMQX accepted the publish (HTTP 200/202)\", () => pm.expect([200, 202]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5B.10 FRIDGE_OVER_TEMPERATURE raised",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/faults?deviceId={{deviceId}}&active=true",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "faults"
+              ],
+              "query": [
+                {
+                  "key": "deviceId",
+                  "value": "{{deviceId}}"
+                },
+                {
+                  "key": "active",
+                  "value": "true"
+                }
+              ]
+            },
+            "description": "Critical fault with trigger value 12.5.\n\n**Expected result:** One active CRITICAL fault."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// give the backend a moment to consume the MQTT message",
+                  "setTimeout(function () {}, 1500);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"FRIDGE_OVER_TEMPERATURE / CRITICAL\", () => { pm.expect(j.content.length).to.eql(1); pm.expect(j.content[0].type).to.eql(\"FRIDGE_OVER_TEMPERATURE\"); pm.expect(j.content[0].severity).to.eql(\"CRITICAL\"); pm.expect(j.content[0].triggerValue).to.eql(12.5); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5B.11 Status is FAULT / CRITICAL_FAULT",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "status"
+              ]
+            },
+            "description": "Critical fault dominates the state machine.\n\n**Expected result:** status FAULT."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"FAULT + CRITICAL_FAULT\", () => { pm.expect(j.status).to.eql(\"FAULT\"); pm.expect(j.operationalState).to.eql(\"CRITICAL_FAULT\"); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5B.12 Fridge recovers (4.0 C)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/publish",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "publish"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"topic\": \"appliance/{{deviceId}}/telemetry\",\n  \"qos\": 1,\n  \"retain\": false,\n  \"payload\": \"{\\\"freezerTemp\\\":-18.0,\\\"fridgeTemp\\\":4.0,\\\"compressorOn\\\":true,\\\"doorOpen\\\":false}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{emqxToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "Temperature back to normal.\n\n**Expected result:** EMQX returns 200/202; the backend receives the message on the device topic."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"EMQX accepted the publish (HTTP 200/202)\", () => pm.expect([200, 202]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5B.13 Fault auto-resolved, device healthy",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/faults?deviceId={{deviceId}}&active=true",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "faults"
+              ],
+              "query": [
+                {
+                  "key": "deviceId",
+                  "value": "{{deviceId}}"
+                },
+                {
+                  "key": "active",
+                  "value": "true"
+                }
+              ]
+            },
+            "description": "Auto-resolution.\n\n**Expected result:** No active faults."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// give the backend a moment to consume the MQTT message",
+                  "setTimeout(function () {}, 1500);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"no active faults\", () => pm.expect(j.content.length).to.eql(0));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5B.14 Status ONLINE again",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "status"
+              ]
+            },
+            "description": "Recovery path.\n\n**Expected result:** ONLINE."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"ONLINE / NORMAL_COOLING\", () => { pm.expect(j.status).to.eql(\"ONLINE\"); pm.expect(j.operationalState).to.eql(\"NORMAL_COOLING\"); });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "6. Firmware management and OTA updates",
+      "description": "Before starting: create test binaries, e.g. `printf 'hello' > fw.bin` (its SHA-256 is 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824). In the three upload requests (6.2, 6.21 and the duplicate 6.3) pick the file under Body > form-data > file. In the Collection Runner enable 'Allow reading files outside working directory' or run these requests manually. Watch the OTA command with `mosquitto_sub -h localhost -p 1883 -t 'appliance/+/ota/command' -v` - it contains jobId, downloadUrl, sha256, signature and strategy DUAL_BANK.",
+      "item": [
+        {
+          "name": "6.0a Heartbeat so device A is ONLINE",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/publish",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "publish"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"topic\": \"appliance/{{deviceId}}/telemetry\",\n  \"qos\": 1,\n  \"retain\": false,\n  \"payload\": \"{\\\"freezerTemp\\\":-18.0,\\\"fridgeTemp\\\":4.4,\\\"compressorOn\\\":true,\\\"doorOpen\\\":false}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{emqxToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "Devices flip to OFFLINE after 90 s without telemetry; send a fresh reading before OTA.\n\n**Expected result:** EMQX returns 200/202; the backend receives the message on the device topic."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"EMQX accepted the publish (HTTP 200/202)\", () => pm.expect([200, 202]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.0b Device A is ONLINE",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "status"
+              ]
+            },
+            "description": "OTA is rejected for OFFLINE devices.\n\n**Expected result:** status ONLINE."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// give the backend a moment to consume the MQTT message",
+                  "setTimeout(function () {}, 1500);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"ONLINE or FAULT (eligible for OTA)\", () => pm.expect([\"ONLINE\", \"FAULT\"]).to.include(j.status));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.1 Upload firmware v-A (min hardware A1)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/firmware",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "firmware"
+              ]
+            },
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": [],
+                  "description": "Select any small file (e.g. created with: printf 'hello' > fw.bin)"
+                },
+                {
+                  "key": "version",
+                  "value": "{{fwVersion}}",
+                  "type": "text"
+                },
+                {
+                  "key": "minHardwareRev",
+                  "value": "A1",
+                  "type": "text"
+                },
+                {
+                  "key": "releaseNotes",
+                  "value": "Postman test release",
+                  "type": "text"
+                }
+              ]
+            },
+            "description": "SELECT A FILE FIRST. The pre-request script generates unique versions ({{fwVersion}} / {{fwVersion2}}). The backend streams the file to disk while computing SHA-256; compare with `sha256sum fw.bin`.\n\n**Expected result:** 201; 64-char lowercase SHA-256; id saved as {{firmwareId}}."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const stamp = Math.floor(Date.now() / 1000) % 100000;",
+                  "pm.collectionVariables.set('fwVersion', '2.' + stamp + '.0');",
+                  "pm.collectionVariables.set('fwVersion2', '3.' + stamp + '.0');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 201\", () => pm.response.to.have.status(201));",
+                  "const j = pm.response.json();",
+                  "pm.collectionVariables.set(\"firmwareId\", j.id); pm.collectionVariables.set(\"fwSha256\", j.checksumSha256); pm.collectionVariables.set(\"fwSize\", j.sizeBytes);",
+                  "pm.test(\"version matches\", () => pm.expect(j.version).to.eql(pm.collectionVariables.get(\"fwVersion\")));",
+                  "pm.test(\"SHA-256 is 64 hex chars\", () => pm.expect(j.checksumSha256).to.match(/^[0-9a-f]{64}$/));",
+                  "pm.test(\"size > 0\", () => pm.expect(j.sizeBytes).to.be.above(0));",
+                  "pm.test(\"download URL points at this firmware\", () => pm.expect(j.downloadUrl).to.include(j.id));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.2 Upload the same version again",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/firmware",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "firmware"
+              ]
+            },
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": [],
+                  "description": "Select any small file (e.g. created with: printf 'hello' > fw.bin)"
+                },
+                {
+                  "key": "version",
+                  "value": "{{fwVersion}}",
+                  "type": "text"
+                },
+                {
+                  "key": "minHardwareRev",
+                  "value": "A1",
+                  "type": "text"
+                },
+                {
+                  "key": "releaseNotes",
+                  "value": "Postman test release",
+                  "type": "text"
+                }
+              ]
+            },
+            "description": "SELECT A FILE FIRST. Version numbers are unique.\n\n**Expected result:** 409 Conflict."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 409\", () => pm.response.to.have.status(409));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"duplicate version message\", () => pm.expect(j.message).to.include(\"already exists\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.3 Upload with invalid version",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/firmware",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "firmware"
+              ]
+            },
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": [],
+                  "description": "Select any small file (e.g. created with: printf 'hello' > fw.bin)"
+                },
+                {
+                  "key": "version",
+                  "value": "abc",
+                  "type": "text"
+                },
+                {
+                  "key": "releaseNotes",
+                  "value": "Postman test release",
+                  "type": "text"
+                }
+              ]
+            },
+            "description": "SELECT A FILE FIRST. Version must be semantic (1.2.3 or 1.2.3-rc1).\n\n**Expected result:** 400."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 400\", () => pm.response.to.have.status(400));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"explains version format\", () => pm.expect(j.message).to.include(\"version must look like\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.4 Upload without file part",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/firmware",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "firmware"
+              ]
+            },
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "version",
+                  "value": "9.9.9",
+                  "type": "text"
+                },
+                {
+                  "key": "releaseNotes",
+                  "value": "Postman test release",
+                  "type": "text"
+                }
+              ]
+            },
+            "description": "No file attached (the file row is removed).\n\n**Expected result:** 400 Malformed request."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 400\", () => pm.response.to.have.status(400));",
+                  "const j = pm.response.json();"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.5 List firmware packages",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/firmware",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "firmware"
+              ]
+            },
+            "description": "Paginated catalogue.\n\n**Expected result:** Includes the uploaded firmware."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"contains firmware A\", () => pm.expect(j.content.map(f => f.id)).to.include(pm.collectionVariables.get(\"firmwareId\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.6 Get firmware metadata",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/firmware/{{firmwareId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "firmware",
+                "{{firmwareId}}"
+              ]
+            },
+            "description": "Single package metadata.\n\n**Expected result:** 200."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"checksum unchanged\", () => pm.expect(j.checksumSha256).to.eql(pm.collectionVariables.get(\"fwSha256\")));",
+                  "pm.test(\"min hardware A1\", () => pm.expect(j.minHardwareRev).to.eql(\"A1\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.7 Download firmware binary (what the MCU does)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/firmware/{{firmwareId}}/download",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "firmware",
+                "{{firmwareId}}",
+                "download"
+              ]
+            },
+            "description": "Use Send and Download to save the file and verify its hash with `sha256sum`.\n\n**Expected result:** 200; checksum and size match."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"X-Checksum-SHA256 header matches\", () => pm.expect(pm.response.headers.get(\"X-Checksum-SHA256\")).to.eql(pm.collectionVariables.get(\"fwSha256\")));",
+                  "pm.test(\"Content-Length matches uploaded size\", () => pm.expect(Number(pm.response.headers.get(\"Content-Length\"))).to.eql(Number(pm.collectionVariables.get(\"fwSize\"))));",
+                  "pm.test(\"served as attachment\", () => pm.expect(pm.response.headers.get(\"Content-Disposition\")).to.include(\"attachment\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.8 Download unknown firmware",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/firmware/00000000-0000-0000-0000-000000000000/download",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "firmware",
+                "00000000-0000-0000-0000-000000000000",
+                "download"
+              ]
+            },
+            "description": "Unknown id.\n\n**Expected result:** 404."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 404\", () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.9 Deploy to A (eligible), B (offline) and an unknown id",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/firmware/{{firmwareId}}/deploy",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "firmware",
+                "{{firmwareId}}",
+                "deploy"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"deviceIds\": [\"{{deviceId}}\", \"{{deviceIdB}}\", \"00000000-0000-0000-0000-000000000000\"]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Per-device outcomes explain every rejection. The backend publishes the signed OTA command to appliance/{deviceId}/ota/command (QoS 1).\n\n**Expected result:** 202; accepted 1 / rejected 2; jobId saved."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 202\", () => pm.response.to.have.status(202));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"1 accepted, 2 rejected\", () => { pm.expect(j.accepted).to.eql(1); pm.expect(j.rejected).to.eql(2); });",
+                  "pm.test(\"device A accepted with a jobId\", () => { pm.expect(j.results[0].accepted).to.eql(true); pm.expect(j.results[0].jobId).to.be.a(\"string\"); });",
+                  "pm.test(\"device B rejected: offline\", () => pm.expect(j.results[1].reason).to.include(\"offline\"));",
+                  "pm.test(\"unknown id rejected: not found\", () => pm.expect(j.results[2].reason).to.include(\"not found\"));",
+                  "pm.collectionVariables.set(\"jobId\", j.results[0].jobId);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.10 OTA job is SENT",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/ota/jobs/{{jobId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "ota",
+                "jobs",
+                "{{jobId}}"
+              ]
+            },
+            "description": "Job created and dispatched.\n\n**Expected result:** status SENT."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"SENT for the right version\", () => { pm.expect(j.status).to.eql(\"SENT\"); pm.expect(j.targetVersion).to.eql(pm.collectionVariables.get(\"fwVersion\")); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.11 Device A is UPDATING",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "status"
+              ]
+            },
+            "description": "Device locked for the update.\n\n**Expected result:** status UPDATING."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"UPDATING\", () => pm.expect(j.status).to.eql(\"UPDATING\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.12 Command rejected while updating",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/commands",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "commands"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"FORCE_DEFROST\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Commands are blocked during OTA.\n\n**Expected result:** 409."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 409\", () => pm.response.to.have.status(409));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"mentions firmware update\", () => pm.expect(j.message).to.include(\"firmware update\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.13 Second deploy while job in flight",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/firmware/{{firmwareId}}/deploy",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "firmware",
+                "{{firmwareId}}",
+                "deploy"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"deviceIds\": [\n    \"{{deviceId}}\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Only one active OTA job per device.\n\n**Expected result:** accepted 0; reason 'already in progress'."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 202\", () => pm.response.to.have.status(202));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"rejected: already in progress\", () => { pm.expect(j.accepted).to.eql(0); pm.expect(j.results[0].reason).to.include(\"already in progress\"); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.14 Device reports DOWNLOADING",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/publish",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "publish"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"topic\": \"appliance/{{deviceId}}/ota/status\",\n  \"qos\": 1,\n  \"retain\": false,\n  \"payload\": \"{\\\"jobId\\\":\\\"{{jobId}}\\\",\\\"status\\\":\\\"DOWNLOADING\\\",\\\"message\\\":\\\"Writing to inactive flash bank\\\"}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{emqxToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "MCU feedback on appliance/{id}/ota/status.\n\n**Expected result:** EMQX returns 200/202; the backend receives the message on the device topic."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"EMQX accepted the publish (HTTP 200/202)\", () => pm.expect([200, 202]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.15 Job is DOWNLOADING",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/ota/jobs/{{jobId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "ota",
+                "jobs",
+                "{{jobId}}"
+              ]
+            },
+            "description": "Progress update applied.\n\n**Expected result:** DOWNLOADING."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// give the backend a moment to consume the MQTT message",
+                  "setTimeout(function () {}, 1500);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"DOWNLOADING\", () => pm.expect(j.status).to.eql(\"DOWNLOADING\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.16 Device reports COMPLETED",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/publish",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "publish"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"topic\": \"appliance/{{deviceId}}/ota/status\",\n  \"qos\": 1,\n  \"retain\": false,\n  \"payload\": \"{\\\"jobId\\\":\\\"{{jobId}}\\\",\\\"version\\\":\\\"{{fwVersion}}\\\",\\\"status\\\":\\\"COMPLETED\\\"}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{emqxToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "MCU verified SHA-256 and signature, swapped banks and rebooted.\n\n**Expected result:** EMQX returns 200/202; the backend receives the message on the device topic."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"EMQX accepted the publish (HTTP 200/202)\", () => pm.expect([200, 202]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.17 Job is COMPLETED",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/ota/jobs/{{jobId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "ota",
+                "jobs",
+                "{{jobId}}"
+              ]
+            },
+            "description": "Terminal success state.\n\n**Expected result:** COMPLETED."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// give the backend a moment to consume the MQTT message",
+                  "setTimeout(function () {}, 1500);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"COMPLETED\", () => pm.expect(j.status).to.eql(\"COMPLETED\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.18 Device runs the new firmware",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}"
+              ]
+            },
+            "description": "Backend updated the device registry.\n\n**Expected result:** firmwareVersion = uploaded version; ONLINE."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"firmware version updated\", () => pm.expect(j.firmwareVersion).to.eql(pm.collectionVariables.get(\"fwVersion\")));",
+                  "pm.test(\"status ONLINE again\", () => pm.expect(j.status).to.eql(\"ONLINE\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.19 Deploy the same firmware again",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/firmware/{{firmwareId}}/deploy",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "firmware",
+                "{{firmwareId}}",
+                "deploy"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"deviceIds\": [\n    \"{{deviceId}}\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "No redundant updates.\n\n**Expected result:** accepted 0."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 202\", () => pm.response.to.have.status(202));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"rejected: already runs it\", () => { pm.expect(j.accepted).to.eql(0); pm.expect(j.results[0].reason).to.include(\"already runs\"); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.20 Upload firmware v-B (min hardware A9)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/firmware",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "firmware"
+              ]
+            },
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": [],
+                  "description": "Select any small file (e.g. created with: printf 'hello' > fw.bin)"
+                },
+                {
+                  "key": "version",
+                  "value": "{{fwVersion2}}",
+                  "type": "text"
+                },
+                {
+                  "key": "minHardwareRev",
+                  "value": "A9",
+                  "type": "text"
+                },
+                {
+                  "key": "releaseNotes",
+                  "value": "Postman test release",
+                  "type": "text"
+                }
+              ]
+            },
+            "description": "SELECT A FILE FIRST. Second image requiring hardware revision A9 or newer; saved as {{firmwareId2}}.\n\n**Expected result:** 201."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 201\", () => pm.response.to.have.status(201));",
+                  "const j = pm.response.json();",
+                  "pm.collectionVariables.set(\"firmwareId2\", j.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.21 Deploy v-B to device A (hardware A2 < A9)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/firmware/{{firmwareId2}}/deploy",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "firmware",
+                "{{firmwareId2}}",
+                "deploy"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"deviceIds\": [\n    \"{{deviceId}}\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Hardware compatibility gate (min_hardware_rev).\n\n**Expected result:** accepted 0; reason mentions minimum hardware."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 202\", () => pm.response.to.have.status(202));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"rejected: below minimum hardware\", () => { pm.expect(j.accepted).to.eql(0); pm.expect(j.results[0].reason).to.include(\"below the required minimum\"); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.22 Upgrade device hardware revision to A10",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"hardwareRev\": \"A10\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Natural ordering means A10 is newer than A9 (a plain string compare would get this wrong).\n\n**Expected result:** 200."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"A10\", () => pm.expect(j.hardwareRev).to.eql(\"A10\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.23 Deploy v-B to device A (now compatible)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/firmware/{{firmwareId2}}/deploy",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "firmware",
+                "{{firmwareId2}}",
+                "deploy"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"deviceIds\": [\n    \"{{deviceId}}\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Device must be ONLINE (rerun 6.0a if more than 90 s passed). Saves {{jobId2}}.\n\n**Expected result:** accepted 1."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 202\", () => pm.response.to.have.status(202));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"accepted\", () => pm.expect(j.accepted).to.eql(1));",
+                  "pm.collectionVariables.set(\"jobId2\", j.results[0].jobId);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.24 Delete firmware while its job is in flight",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/firmware/{{firmwareId2}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "firmware",
+                "{{firmwareId2}}"
+              ]
+            },
+            "description": "Protects running updates.\n\n**Expected result:** 409."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 409\", () => pm.response.to.have.status(409));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"explains the conflict\", () => pm.expect(j.message).to.include(\"in progress\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.25 Device reports FAILED (rolled back)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/publish",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "publish"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"topic\": \"appliance/{{deviceId}}/ota/status\",\n  \"qos\": 1,\n  \"retain\": false,\n  \"payload\": \"{\\\"jobId\\\":\\\"{{jobId2}}\\\",\\\"version\\\":\\\"{{fwVersion2}}\\\",\\\"status\\\":\\\"FAILED\\\",\\\"message\\\":\\\"Checksum mismatch, rolled back to bank A\\\"}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{emqxToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "Dual-bank safety: the MCU keeps running the old image and reports failure.\n\n**Expected result:** EMQX returns 200/202; the backend receives the message on the device topic."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"EMQX accepted the publish (HTTP 200/202)\", () => pm.expect([200, 202]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.26 Job is FAILED",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/ota/jobs/{{jobId2}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "ota",
+                "jobs",
+                "{{jobId2}}"
+              ]
+            },
+            "description": "Failure recorded.\n\n**Expected result:** FAILED."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// give the backend a moment to consume the MQTT message",
+                  "setTimeout(function () {}, 1500);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"FAILED with reason\", () => { pm.expect(j.status).to.eql(\"FAILED\"); pm.expect(j.message).to.include(\"Checksum mismatch\"); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.27 Device keeps old firmware and is ONLINE",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}"
+              ]
+            },
+            "description": "Rollback path.\n\n**Expected result:** Old firmware, ONLINE."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"still on version A\", () => pm.expect(j.firmwareVersion).to.eql(pm.collectionVariables.get(\"fwVersion\")));",
+                  "pm.test(\"ONLINE\", () => pm.expect(j.status).to.eql(\"ONLINE\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.28 List OTA jobs for the device",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/ota/jobs?deviceId={{deviceId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "ota",
+                "jobs"
+              ],
+              "query": [
+                {
+                  "key": "deviceId",
+                  "value": "{{deviceId}}"
+                }
+              ]
+            },
+            "description": "Job history.\n\n**Expected result:** At least 2 jobs."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"2 jobs\", () => pm.expect(j.totalElements).to.be.at.least(2));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.29 List OTA jobs filtered by status=COMPLETED",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/ota/jobs?status=COMPLETED",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "ota",
+                "jobs"
+              ],
+              "query": [
+                {
+                  "key": "status",
+                  "value": "COMPLETED"
+                }
+              ]
+            },
+            "description": "Status filter.\n\n**Expected result:** Only COMPLETED jobs."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"all COMPLETED\", () => j.content.forEach(x => pm.expect(x.status).to.eql(\"COMPLETED\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.30 Unknown OTA job",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/ota/jobs/00000000-0000-0000-0000-000000000000",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "ota",
+                "jobs",
+                "00000000-0000-0000-0000-000000000000"
+              ]
+            },
+            "description": "Unknown id.\n\n**Expected result:** 404."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 404\", () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.31 Delete firmware v-B",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/firmware/{{firmwareId2}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "firmware",
+                "{{firmwareId2}}"
+              ]
+            },
+            "description": "Job is finished, so deletion is allowed.\n\n**Expected result:** 204."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 204\", () => pm.response.to.have.status(204));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.32 Delete firmware v-A",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/firmware/{{firmwareId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "firmware",
+                "{{firmwareId}}"
+              ]
+            },
+            "description": "Removes DB row and file.\n\n**Expected result:** 204."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 204\", () => pm.response.to.have.status(204));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.33 Job history survives firmware deletion",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/ota/jobs/{{jobId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "ota",
+                "jobs",
+                "{{jobId}}"
+              ]
+            },
+            "description": "FK is ON DELETE SET NULL.\n\n**Expected result:** 200; COMPLETED; no firmwareId."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"job kept, firmware link cleared\", () => { pm.expect(j.status).to.eql(\"COMPLETED\"); pm.expect(j.firmwareId).to.be.undefined; });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.34 Deleted firmware is gone",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/firmware/{{firmwareId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "firmware",
+                "{{firmwareId}}"
+              ]
+            },
+            "description": "Confirm deletion.\n\n**Expected result:** 404."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 404\", () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "7. Heartbeat supervision (MANUAL - exclude from Runner)",
+      "description": "A device with no message for 90 s is marked OFFLINE by the scheduler (runs every 30 s), so wait about 2.5 minutes after the last telemetry before 7.1.",
+      "item": [
+        {
+          "name": "7.1 After ~150 s of silence: OFFLINE",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "status"
+              ]
+            },
+            "description": "Do not send any telemetry for device A for 2.5 minutes, then send this request.\n\n**Expected result:** status OFFLINE."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"OFFLINE\", () => { pm.expect(j.status).to.eql(\"OFFLINE\"); pm.expect(j.online).to.eql(false); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "7.2 Device comes back (telemetry)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{emqxUrl}}/api/v5/publish",
+              "host": [
+                "{{emqxUrl}}"
+              ],
+              "path": [
+                "api",
+                "v5",
+                "publish"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"topic\": \"appliance/{{deviceId}}/telemetry\",\n  \"qos\": 1,\n  \"retain\": false,\n  \"payload\": \"{\\\"freezerTemp\\\":-18.0,\\\"fridgeTemp\\\":4.3,\\\"compressorOn\\\":true,\\\"doorOpen\\\":false}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{emqxToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "description": "First message after the outage.\n\n**Expected result:** EMQX returns 200/202; the backend receives the message on the device topic."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"EMQX accepted the publish (HTTP 200/202)\", () => pm.expect([200, 202]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "7.3 Back to ONLINE",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "status"
+              ]
+            },
+            "description": "Heartbeat restored the status.\n\n**Expected result:** ONLINE."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// give the backend a moment to consume the MQTT message",
+                  "setTimeout(function () {}, 1500);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"ONLINE\", () => pm.expect(j.status).to.eql(\"ONLINE\"));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "8. Cleanup",
+      "description": "Deletes the test devices (telemetry, faults and OTA jobs are removed by ON DELETE CASCADE).",
+      "item": [
+        {
+          "name": "8.1 Delete device A",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}"
+              ]
+            },
+            "description": "Cascade delete.\n\n**Expected result:** 204."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 204\", () => pm.response.to.have.status(204));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "8.2 Delete device B",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceIdB}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceIdB}}"
+              ]
+            },
+            "description": "Cascade delete.\n\n**Expected result:** 204."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 204\", () => pm.response.to.have.status(204));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "8.3 Device A is gone",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}"
+              ]
+            },
+            "description": "Confirm.\n\n**Expected result:** 404."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 404\", () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "8.4 Telemetry of deleted device",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/devices/{{deviceId}}/telemetry",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "devices",
+                "{{deviceId}}",
+                "telemetry"
+              ]
+            },
+            "description": "Confirm.\n\n**Expected result:** 404."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"HTTP 404\", () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "emqxUrl",
+      "value": "http://localhost:18083"
+    },
+    {
+      "key": "emqxUser",
+      "value": "admin"
+    },
+    {
+      "key": "emqxPass",
+      "value": "public"
+    },
+    {
+      "key": "emqxToken",
+      "value": ""
+    }
+  ]
+}

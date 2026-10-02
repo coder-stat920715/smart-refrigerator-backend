@@ -1,0 +1,65 @@
+services:
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    container_name: fridge-postgres
+    environment:
+      POSTGRES_DB: smartfridge
+      POSTGRES_USER: smartfridge
+      POSTGRES_PASSWORD: smartfridge
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smartfridge -d smartfridge"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  emqx:
+    image: emqx/emqx:5.6.1
+    container_name: fridge-emqx
+    environment:
+      EMQX_NAME: emqx
+      EMQX_HOST: 127.0.0.1
+    ports:
+      - "1883:1883"     # MQTT (plain, local dev only)
+      - "8883:8883"     # MQTT over TLS (configure certificates for production)
+      - "8083:8083"     # MQTT over WebSocket
+      - "18083:18083"   # EMQX dashboard (admin / public)
+    volumes:
+      - emqx-data:/opt/emqx/data
+      - emqx-log:/opt/emqx/log
+    healthcheck:
+      test: ["CMD", "/opt/emqx/bin/emqx", "ctl", "status"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fridge-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      emqx:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/smartfridge
+      SPRING_DATASOURCE_USERNAME: smartfridge
+      SPRING_DATASOURCE_PASSWORD: smartfridge
+      APP_MQTT_BROKER_URL: tcp://emqx:1883
+      APP_FIRMWARE_PUBLIC_BASE_URL: http://localhost:8080
+      APP_FIRMWARE_SIGNING_SECRET: change-me-in-production
+    ports:
+      - "8080:8080"
+    volumes:
+      - firmware-data:/app/firmware-store
+
+volumes:
+  postgres-data:
+  emqx-data:
+  emqx-log:
+  firmware-data:
